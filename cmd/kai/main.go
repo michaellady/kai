@@ -18,6 +18,7 @@ import (
 
 	"github.com/mikelady/kai/internal/gdocs"
 	"github.com/mikelady/kai/internal/gemini"
+	"github.com/mikelady/kai/internal/newsletter"
 	"github.com/mikelady/kai/internal/scan"
 	"github.com/mikelady/kai/internal/state"
 	"github.com/mikelady/kai/internal/youtube"
@@ -27,6 +28,7 @@ const (
 	folderName       = "Kai Transcripts"
 	candidatesCSV    = "selfie_videos.csv"
 	ytCandidatesCSV  = "youtube_videos.csv"
+	nlCandidatesCSV  = "newsletter_posts.csv"
 	processLogPath   = "process_log.json"
 	monthlyDocsPath  = "monthly_docs.json"
 	clientSecretsIn  = "client_secrets.json"
@@ -36,8 +38,9 @@ const (
 	kaiLogPath       = "tmp/kai.log"
 	delayBetweenVids = 5 * time.Second
 
-	sourceApple   = "apple-photos"
-	sourceYouTube = "youtube"
+	sourceApple      = "apple-photos"
+	sourceYouTube    = "youtube"
+	sourceNewsletter = "newsletter"
 )
 
 func main() {
@@ -53,7 +56,7 @@ func main() {
 	// Tee output to tmp/kai.log for long-running commands so `kai tail-run`
 	// can follow progress from another terminal.
 	var teeClose func()
-	if cmd == "process" || cmd == "youtube" {
+	if cmd == "process" || cmd == "youtube" || cmd == "newsletter" {
 		c, terr := setupTee()
 		if terr != nil {
 			fmt.Fprintf(os.Stderr, "warning: tee log setup failed: %v\n", terr)
@@ -87,6 +90,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "unknown youtube subcommand %q\n", sub)
 			os.Exit(2)
 		}
+	case "newsletter":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: kai newsletter {scan|process} [...]")
+			os.Exit(2)
+		}
+		sub, rest := args[0], args[1:]
+		switch sub {
+		case "scan":
+			err = runNewsletterScan(ctx, rest)
+		case "process":
+			err = runNewsletterProcess(ctx, rest)
+		default:
+			fmt.Fprintf(os.Stderr, "unknown newsletter subcommand %q\n", sub)
+			os.Exit(2)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -109,6 +127,8 @@ usage:
   kai stats
   kai youtube scan         [--channel-url URL]
   kai youtube process      [--limit N] [--allow-partial-monthly] [--model MODEL]
+  kai newsletter scan      [--feed-url URL]
+  kai newsletter process   [--limit N] [--allow-partial-monthly] [--model MODEL]
   kai tail-run                       follow tmp/kai.log (live progress of a running process)`)
 }
 
@@ -331,9 +351,19 @@ func processOne(
 	}
 	defer func() { _ = os.RemoveAll(tmpDownloadDir + "/" + c.UUID) }()
 
-	// 2. Transcribe via Gemini.
+	// 2. Extract audio track — iPhone videos are too large for Gemini's
+	// file processor (often 1GB+). Audio is ~1% the size and carries all
+	// of the spoken content we care about for driving monologues.
+	audioPath := localPath + ".m4a"
+	fmt.Printf("  extracting audio…\n")
+	if err := scan.ExtractAudio(ctx, localPath, audioPath); err != nil {
+		return stageErr("ffmpeg", err)
+	}
+	defer func() { _ = os.Remove(audioPath) }()
+
+	// 3. Transcribe via Gemini (on audio).
 	fmt.Printf("  transcribing…\n")
-	res, err := gem.Transcribe(ctx, localPath)
+	res, err := gem.Transcribe(ctx, audioPath)
 	if err != nil {
 		return stageErr("gemini", err)
 	}
@@ -643,15 +673,275 @@ func processOneYouTube(
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// newsletter scan + process
+// ---------------------------------------------------------------------------
+
+func runNewsletterScan(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("newsletter scan", flag.ExitOnError)
+	feed := fs.String("feed-url", newsletter.DefaultFeedURL, "beehiiv RSS feed URL")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	fmt.Printf("Fetching newsletter feed %s…\n", *feed)
+	posts, err := newsletter.FetchFeed(ctx, *feed)
+	if err != nil {
+		return err
+	}
+	if err := newsletter.WriteCSV(nlCandidatesCSV, posts); err != nil {
+		return err
+	}
+	fmt.Printf("Wrote %s: %d posts.\n", nlCandidatesCSV, len(posts))
+	fmt.Println("Edit the CSV: set `process` to `no` for rows you want to skip.")
+	return nil
+}
+
+func runNewsletterProcess(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("newsletter process", flag.ExitOnError)
+	limit := fs.Int("limit", 10, "max posts to process this run")
+	allowPartial := fs.Bool("allow-partial-monthly", false, "write a monthly overview for every month touched")
+	modelFlag := fs.String("model", "", "Gemini model (default env GEMINI_MODEL or gemini-2.5-flash)")
+	feed := fs.String("feed-url", newsletter.DefaultFeedURL, "beehiiv RSS feed URL")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	model := *modelFlag
+	if model == "" {
+		model = os.Getenv("GEMINI_MODEL")
+	}
+
+	posts, err := newsletter.ReadCSV(nlCandidatesCSV)
+	if err != nil {
+		return fmt.Errorf("read %s: %w (run `kai newsletter scan` first)", nlCandidatesCSV, err)
+	}
+	procLog, err := state.LoadProcessLog(processLogPath)
+	if err != nil {
+		return err
+	}
+	monthly, err := state.LoadMonthlyDocs(monthlyDocsPath)
+	if err != nil {
+		return err
+	}
+
+	var batch []newsletter.Post
+	for _, p := range posts {
+		if _, done := procLog[p.URL]; done {
+			continue
+		}
+		batch = append(batch, p)
+		if len(batch) >= *limit {
+			break
+		}
+	}
+	if len(batch) == 0 {
+		fmt.Println("Nothing to process — every `yes` row is already in process_log.json.")
+		return nil
+	}
+	fmt.Printf("Processing %d post(s).\n", len(batch))
+
+	// Re-fetch the feed once so we have HTML bodies for all candidates.
+	full, err := newsletter.FetchFeed(ctx, *feed)
+	if err != nil {
+		return fmt.Errorf("feed refetch: %w", err)
+	}
+	byURL := make(map[string]newsletter.Post, len(full))
+	for _, p := range full {
+		byURL[p.URL] = p
+	}
+
+	apiKey, err := gemini.LoadAPIKey()
+	if err != nil {
+		return err
+	}
+	gem, err := gemini.NewClient(ctx, apiKey, model)
+	if err != nil {
+		return fmt.Errorf("gemini client: %w", err)
+	}
+	gd, err := gdocs.New(ctx, clientSecretsIn, tokenPath)
+	if err != nil {
+		return fmt.Errorf("gdocs: %w", err)
+	}
+	folderID, err := gd.GetOrCreateFolder(ctx, folderName)
+	if err != nil {
+		return fmt.Errorf("folder: %w", err)
+	}
+
+	summary := state.RunSummary{StartedAt: time.Now(), Model: model}
+	touchedMonths := map[string]bool{}
+	docsTouched := map[string]bool{}
+
+	for i, p := range batch {
+		fmt.Printf("\n[%d/%d] %s  %s\n", i+1, len(batch), p.PublishDate, p.Title)
+		summary.Attempted++
+		full, ok := byURL[p.URL]
+		if !ok || full.HTML == "" {
+			summary.Failed++
+			summary.Failures = append(summary.Failures, state.RunFailure{UUID: p.URL, Stage: "newsletter_empty_body", Error: "no content:encoded in feed for this URL"})
+			fmt.Println("  FAILED: no content:encoded in feed")
+			continue
+		}
+		if err := processOneNewsletter(ctx, gem, gd, folderID, &full, procLog, monthly, docsTouched, &summary); err != nil {
+			summary.Failed++
+			summary.Failures = append(summary.Failures, state.RunFailure{UUID: p.URL, Stage: stageOf(err), Error: err.Error()})
+			fmt.Printf("  FAILED: %v\n", err)
+			_ = state.SaveProcessLog(processLogPath, procLog)
+			_ = state.SaveMonthlyDocs(monthlyDocsPath, monthly)
+			continue
+		}
+		summary.Succeeded++
+		touchedMonths[monthKey(p.PublishDate)] = true
+		if err := state.SaveProcessLog(processLogPath, procLog); err != nil {
+			return err
+		}
+		if err := state.SaveMonthlyDocs(monthlyDocsPath, monthly); err != nil {
+			return err
+		}
+		if i < len(batch)-1 {
+			select {
+			case <-time.After(1 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	if *allowPartial && len(touchedMonths) > 0 {
+		fmt.Println("\nCompiling monthly overviews…")
+		for m := range touchedMonths {
+			mdoc, ok := monthly[m]
+			if !ok || mdoc.DocID == "" {
+				continue
+			}
+			body, err := gd.ReadBody(ctx, mdoc.DocID)
+			if err != nil {
+				fmt.Printf("  %s: read body failed: %v\n", m, err)
+				continue
+			}
+			overview, err := gem.MonthlyOverview(ctx, body)
+			if err != nil {
+				fmt.Printf("  %s: overview generate failed: %v\n", m, err)
+				continue
+			}
+			block := fmt.Sprintf("\n\n---\n\n_Overview compiled from %d recordings so far._\n\n%s\n",
+				mdoc.EntryCount, overview)
+			if err := gd.AppendEntry(ctx, mdoc.DocID, block); err != nil {
+				fmt.Printf("  %s: append overview failed: %v\n", m, err)
+				continue
+			}
+			mdoc.MonthlySummaryDone = "partial"
+			monthly[m] = mdoc
+			fmt.Printf("  %s: overview written (%d entries).\n", m, mdoc.EntryCount)
+		}
+		if err := state.SaveMonthlyDocs(monthlyDocsPath, monthly); err != nil {
+			return err
+		}
+	}
+
+	summary.FinishedAt = time.Now()
+	summary.WallClockSec = summary.FinishedAt.Sub(summary.StartedAt).Seconds()
+	for id := range docsTouched {
+		summary.DocsTouched = append(summary.DocsTouched, id)
+	}
+	sort.Strings(summary.DocsTouched)
+	summary.EstimatedCostUSD = float64(summary.Succeeded) * 0.001
+
+	path, err := state.SaveRunSummary(".", summary)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nTL;DR: %d/%d succeeded, %d failed, ~$%.3f, %s  →  %s\n",
+		summary.Succeeded, summary.Attempted, summary.Failed,
+		summary.EstimatedCostUSD, fmtDuration(summary.WallClockSec), path)
+	return nil
+}
+
+func processOneNewsletter(
+	ctx context.Context,
+	gem *gemini.Client,
+	gd *gdocs.Service,
+	folderID string,
+	p *newsletter.Post,
+	procLog state.ProcessLog,
+	monthly state.MonthlyDocs,
+	docsTouched map[string]bool,
+	_ *state.RunSummary,
+) error {
+	// 1. HTML → plain text.
+	plain := newsletter.ParseHTMLToText(p.HTML)
+	if strings.TrimSpace(plain) == "" {
+		return stageErr("newsletter_empty_body", fmt.Errorf("parsed HTML was empty for %s", p.URL))
+	}
+
+	// 2. Gemini: summary + tags only.
+	fmt.Printf("  summarizing (%d KB of body)…\n", len(plain)/1024)
+	res, err := gem.Summarize(ctx, plain)
+	if err != nil {
+		return stageErr("gemini", err)
+	}
+
+	// 3. Monthly doc.
+	mk := monthKey(p.PublishDate)
+	ml := monthLabel(p.PublishDate)
+	mdoc, ok := monthly[mk]
+	if !ok || mdoc.DocID == "" {
+		title := fmt.Sprintf("Thoughts — %s", ml)
+		if id, err := gd.FindDocInFolder(ctx, folderID, title); err != nil {
+			return stageErr("drive_find", err)
+		} else if id != "" {
+			mdoc = state.MonthlyDoc{DocID: id, DocURL: fmt.Sprintf("https://docs.google.com/document/d/%s/edit", id)}
+		} else {
+			id, url, err := gd.CreateDoc(ctx, folderID, title, ml)
+			if err != nil {
+				return stageErr("drive_create", err)
+			}
+			mdoc = state.MonthlyDoc{DocID: id, DocURL: url}
+		}
+	}
+
+	// 4. Append. Duration is empty for newsletter posts.
+	block := formatEntry(p.PublishDate, "", sourceNewsletter, p.URL, res)
+	if err := gd.AppendEntry(ctx, mdoc.DocID, block); err != nil {
+		return stageErr("docs_append", err)
+	}
+	mdoc.EntryCount++
+	monthly[mk] = mdoc
+	docsTouched[mdoc.DocID] = true
+
+	// 5. Header update.
+	if err := gd.UpdateHeader(ctx, mdoc.DocID, ml, mdoc.EntryCount, humanDuration(mdoc.TotalDurationSec)); err != nil {
+		fmt.Printf("  warning: header update failed: %v\n", err)
+	}
+
+	// 6. Log.
+	procLog[p.URL] = state.ProcessLogEntry{
+		DocID:       mdoc.DocID,
+		DocURL:      mdoc.DocURL,
+		MonthKey:    mk,
+		Summary:     res.Summary,
+		Tags:        res.Tags,
+		Date:        p.PublishDate,
+		DurationSec: 0,
+		ProcessedAt: time.Now(),
+		Source:      sourceNewsletter,
+		SourceURL:   p.URL,
+	}
+	fmt.Printf("  done.  tags=%v\n", res.Tags)
+	return nil
+}
+
 func formatEntry(date, durationHuman, source, sourceURL string, res *gemini.TranscribeResult) string {
 	tags := strings.Join(res.Tags, ", ")
 	srcLine := fmt.Sprintf("**Source:** %s", source)
 	if sourceURL != "" {
 		srcLine = fmt.Sprintf("**Source:** %s ([link](%s))", source, sourceURL)
 	}
+	heading := date
+	if durationHuman != "" {
+		heading = fmt.Sprintf("%s — %s", date, durationHuman)
+	}
 	return fmt.Sprintf(
-		"\n### %s — %s\n\n%s\n**Tags:** %s\n**Summary:** %s\n\n%s\n\n---\n",
-		date, durationHuman, srcLine, tags, res.Summary, res.Transcript,
+		"\n### %s\n\n%s\n**Tags:** %s\n**Summary:** %s\n\n%s\n\n---\n",
+		heading, srcLine, tags, res.Summary, res.Transcript,
 	)
 }
 

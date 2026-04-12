@@ -252,6 +252,28 @@ func AllRows(path string) ([]Candidate, error) {
 	return out, nil
 }
 
+// ExtractAudio shells out to ffmpeg to copy the audio track (no re-encode)
+// from videoPath to destPath. Driving-selfie videos are overwhelmingly
+// verbal — the audio track contains effectively all of the content and is
+// ~1/100th the size, which sidesteps Gemini's File-API processing limits
+// on multi-GB video uploads.
+func ExtractAudio(ctx context.Context, videoPath, destPath string) error {
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-v", "error",
+		"-y",
+		"-i", videoPath,
+		"-vn",
+		"-acodec", "copy",
+		destPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg extract audio: %w (stderr: %s)", err, stderr.String())
+	}
+	return nil
+}
+
 // DownloadVideo uses osxphotos export --download-missing --use-photokit to
 // pull a single UUID from iCloud into destDir. Returns the downloaded file
 // path.
@@ -281,17 +303,23 @@ func DownloadVideo(ctx context.Context, uuid, destDir string) (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("osxphotos export uuid=%s: %w (stderr: %s)", uuid, err, stderr.String())
 	}
-	// Find the first file in sub.
+	// Find the exported media file. Skip osxphotos' hidden state files
+	// (e.g. .osxphotos_export.db) and any dotfiles.
 	entries, err := os.ReadDir(sub)
 	if err != nil {
 		return "", err
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
-			return filepath.Join(sub, e.Name()), nil
+		if e.IsDir() {
+			continue
 		}
+		name := e.Name()
+		if name[0] == '.' {
+			continue
+		}
+		return filepath.Join(sub, name), nil
 	}
-	return "", fmt.Errorf("osxphotos export uuid=%s produced no file (stderr: %s)", uuid, stderr.String())
+	return "", fmt.Errorf("osxphotos export uuid=%s produced no media file (stderr: %s)", uuid, stderr.String())
 }
 
 // ---------------------------------------------------------------------------

@@ -56,6 +56,8 @@ go build -o kai ./cmd/kai
 ./kai process --limit 10 --allow-partial-monthly
 ./kai youtube scan                  # YouTube past livestreams → youtube_videos.csv
 ./kai youtube process --limit 5 --allow-partial-monthly
+./kai newsletter scan               # beehiiv RSS → newsletter_posts.csv
+./kai newsletter process --limit 5 --allow-partial-monthly
 ./kai stats
 ```
 
@@ -73,6 +75,8 @@ Edit the CSVs between `scan` and `process`: flip `process` from `yes` to `no` fo
 | process | `--model` | `gemini-2.5-flash` | Override via flag or `GEMINI_MODEL` env. |
 | youtube scan | `--channel-url` | `https://www.youtube.com/@EnterpriseVibeCode/streams` | Point at any channel's past-streams URL. |
 | youtube process | `--limit` / `--allow-partial-monthly` / `--model` | same defaults | Uses auto-captions; Gemini does cleanup + summary only. |
+| newsletter scan | `--feed-url` | EVC beehiiv feed | Fetches an RSS 2.0 feed; works with any beehiiv or similar publication. |
+| newsletter process | `--limit` / `--allow-partial-monthly` / `--model` / `--feed-url` | same defaults | Strips HTML locally; Gemini does summary+tags only (cheapest source). |
 
 ## NotebookLM
 
@@ -86,6 +90,7 @@ Edit the CSVs between `scan` and `process`: flip `process` from `yes` to `no` fo
 |---|---|---|
 | `selfie_videos.csv` | Apple-Photos scan output; user-editable. | ✓ |
 | `youtube_videos.csv` | YouTube-streams scan output; user-editable. | ✓ |
+| `newsletter_posts.csv` | Newsletter scan output; user-editable. | ✓ |
 | `process_log.json` | Per-video state for idempotent re-runs. | ✓ |
 | `monthly_docs.json` | Monthly Doc ID registry. | ✓ |
 | `run_summary_*.json` | Per-run audit trail. | ✓ |

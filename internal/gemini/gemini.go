@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -49,8 +50,17 @@ type TranscribeResult struct {
 // The uploaded file is deleted before return regardless of outcome.
 func (c *Client) Transcribe(ctx context.Context, path string) (*TranscribeResult, error) {
 	mime := "video/mp4"
-	if strings.HasSuffix(strings.ToLower(path), ".mov") {
+	switch strings.ToLower(filepathExt(path)) {
+	case ".mov":
 		mime = "video/quicktime"
+	case ".m4a", ".mp4a":
+		mime = "audio/mp4"
+	case ".mp3":
+		mime = "audio/mpeg"
+	case ".aac":
+		mime = "audio/aac"
+	case ".wav":
+		mime = "audio/wav"
 	}
 	file, err := retry.Do(ctx, func(ctx context.Context) (*genai.File, error) {
 		return c.inner.Files.UploadFromPath(ctx, path, &genai.UploadFileConfig{MIMEType: mime})
@@ -145,6 +155,28 @@ func (c *Client) CleanCaption(ctx context.Context, raw string) (*TranscribeResul
 	return &TranscribeResult{Transcript: transcript, Summary: summary, Tags: tags}, nil
 }
 
+// Summarize runs just the Summary+Tags prompt on already-clean plain text
+// (e.g. newsletter posts). Returns a TranscribeResult whose Transcript is
+// the input unchanged, so callers can funnel newsletter content through
+// the same monthly-doc append path as livestreams and driving videos.
+func (c *Client) Summarize(ctx context.Context, plainText string) (*TranscribeResult, error) {
+	resp, err := retry.Do(ctx, func(ctx context.Context) (*genai.GenerateContentResponse, error) {
+		parts := []*genai.Part{
+			{Text: prompts.Summary + "\n\nTranscript:\n" + plainText},
+		}
+		contents := []*genai.Content{{Parts: parts, Role: genai.RoleUser}}
+		return c.inner.Models.GenerateContent(ctx, c.model, contents, nil)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("summary generate: %w", err)
+	}
+	summary, tags, err := parseSummaryJSON(resp.Text())
+	if err != nil {
+		return nil, fmt.Errorf("summary parse: %w", err)
+	}
+	return &TranscribeResult{Transcript: plainText, Summary: summary, Tags: tags}, nil
+}
+
 // MonthlyOverview asks Gemini to synthesize a monthly overview from all of
 // the month's per-entry summaries + tags + transcripts. For partial months,
 // the caller prepends a disclaimer line outside this call.
@@ -211,6 +243,8 @@ func parseSummaryJSON(raw string) (string, []string, error) {
 	}
 	return payload.Summary, payload.Tags, nil
 }
+
+func filepathExt(p string) string { return filepath.Ext(p) }
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

@@ -5,6 +5,8 @@ gemini_api_key.txt
 google_token.json
 selfie_videos.csv
 youtube_videos.csv
+newsletter_posts.csv
+osxphotos_crash.log
 process_log.json
 monthly_docs.json
 run_summary_*.json
