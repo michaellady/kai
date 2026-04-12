@@ -1,0 +1,14 @@
+.claude/
+.venv/
+client_secrets.json
+gemini_api_key.txt
+google_token.json
+selfie_videos.csv
+youtube_videos.csv
+process_log.json
+monthly_docs.json
+run_summary_*.json
+/kai
+*.MOV
+*.vtt
+tmp/
