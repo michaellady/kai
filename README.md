@@ -1,6 +1,12 @@
-# Kai — Phase 0 POC
+# Kai
 
-Ingest driving selfie videos → transcribe with Gemini → batch into monthly Google Docs → feed into NotebookLM.
+> **"Thoughts become things."** — Kai Greene
+
+Named for the bodybuilder and two-time Mr. Olympia runner-up Kai Greene, whose line "thoughts become things" is the whole point. Kai the tool turns thinking (driving monologues, livestream riffs) into durable, queryable things.
+
+## Phase 0 POC
+
+Ingest driving selfie videos + past YouTube livestreams → transcribe with Gemini → batch into monthly Google Docs → feed into NotebookLM.
 
 See `KAI_PLAN.md` for the full project vision across all phases.
 
