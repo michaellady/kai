@@ -258,12 +258,16 @@ func AllRows(path string) ([]Candidate, error) {
 // ~1/100th the size, which sidesteps Gemini's File-API processing limits
 // on multi-GB video uploads.
 func ExtractAudio(ctx context.Context, videoPath, destPath string) error {
+	// -acodec copy is fast but fails on source containers with codecs the
+	// m4a wrapper can't hold (e.g. PCM from dedicated cameras like Sony
+	// C00XX.MP4 files). Transcode to AAC — tiny re-encode cost, universal.
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-v", "error",
 		"-y",
 		"-i", videoPath,
 		"-vn",
-		"-acodec", "copy",
+		"-acodec", "aac",
+		"-b:a", "128k",
 		destPath,
 	)
 	var stderr bytes.Buffer

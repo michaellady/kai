@@ -21,6 +21,7 @@ import (
 	"github.com/mikelady/kai/internal/newsletter"
 	"github.com/mikelady/kai/internal/scan"
 	"github.com/mikelady/kai/internal/state"
+	"github.com/mikelady/kai/internal/vournal"
 	"github.com/mikelady/kai/internal/youtube"
 )
 
@@ -29,6 +30,8 @@ const (
 	candidatesCSV    = "selfie_videos.csv"
 	ytCandidatesCSV  = "youtube_videos.csv"
 	nlCandidatesCSV  = "newsletter_posts.csv"
+	vnCandidatesCSV  = "vournal_entries.csv"
+	vnDefaultFile    = "recovered_vournal_transcripts"
 	processLogPath   = "process_log.json"
 	monthlyDocsPath  = "monthly_docs.json"
 	clientSecretsIn  = "client_secrets.json"
@@ -41,6 +44,7 @@ const (
 	sourceApple      = "apple-photos"
 	sourceYouTube    = "youtube"
 	sourceNewsletter = "newsletter"
+	sourceVournal    = "vournal-recovered"
 )
 
 func main() {
@@ -56,7 +60,7 @@ func main() {
 	// Tee output to tmp/kai.log for long-running commands so `kai tail-run`
 	// can follow progress from another terminal.
 	var teeClose func()
-	if cmd == "process" || cmd == "youtube" || cmd == "newsletter" {
+	if cmd == "process" || cmd == "youtube" || cmd == "newsletter" || cmd == "vournal" {
 		c, terr := setupTee()
 		if terr != nil {
 			fmt.Fprintf(os.Stderr, "warning: tee log setup failed: %v\n", terr)
@@ -105,6 +109,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "unknown newsletter subcommand %q\n", sub)
 			os.Exit(2)
 		}
+	case "vournal":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: kai vournal {scan|process} [...]")
+			os.Exit(2)
+		}
+		sub, rest := args[0], args[1:]
+		switch sub {
+		case "scan":
+			err = runVournalScan(ctx, rest)
+		case "process":
+			err = runVournalProcess(ctx, rest)
+		default:
+			fmt.Fprintf(os.Stderr, "unknown vournal subcommand %q\n", sub)
+			os.Exit(2)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -129,6 +148,8 @@ usage:
   kai youtube process      [--limit N] [--allow-partial-monthly] [--model MODEL]
   kai newsletter scan      [--feed-url URL]
   kai newsletter process   [--limit N] [--allow-partial-monthly] [--model MODEL]
+  kai vournal scan         [--file PATH]
+  kai vournal process      [--limit N] [--allow-partial-monthly] [--model MODEL] [--file PATH]
   kai tail-run                       follow tmp/kai.log (live progress of a running process)`)
 }
 
@@ -183,6 +204,7 @@ func runProcess(ctx context.Context, args []string) error {
 	limit := fs.Int("limit", 10, "max videos to process this run")
 	allowPartial := fs.Bool("allow-partial-monthly", false, "write a monthly overview for every month touched, even if not all videos done")
 	modelFlag := fs.String("model", "", "Gemini model (default env GEMINI_MODEL or gemini-2.5-flash)")
+	dryRun := fs.Bool("dry-run", false, "print what would be processed without touching iCloud, Gemini, or Google Docs")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -218,6 +240,19 @@ func runProcess(ctx context.Context, args []string) error {
 	}
 	if len(batch) == 0 {
 		fmt.Println("Nothing to process — every `yes` row is already in process_log.json.")
+		return nil
+	}
+	if *dryRun {
+		var totalSec float64
+		for _, c := range batch {
+			totalSec += c.DurationSec
+		}
+		hours := totalSec / 3600
+		fmt.Printf("[dry-run] Would process %d video(s), %s of audio, est Gemini $%.2f.\n",
+			len(batch), fmtDuration(totalSec), hours*0.25)
+		for _, c := range batch {
+			fmt.Printf("  %s  %s  %s\n", c.Date[:10], c.DurationHuman, c.Filename)
+		}
 		return nil
 	}
 	fmt.Printf("Processing %d video(s).\n", len(batch))
@@ -345,7 +380,9 @@ func processOne(
 	} else {
 		fmt.Printf("  exporting local copy…\n")
 	}
-	localPath, err := scan.DownloadVideo(ctx, c.UUID, tmpDownloadDir)
+	downloadCtx, cancelDownload := context.WithTimeout(ctx, 15*time.Minute)
+	localPath, err := scan.DownloadVideo(downloadCtx, c.UUID, tmpDownloadDir)
+	cancelDownload()
 	if err != nil {
 		return stageErr("icloud_download", err)
 	}
@@ -924,6 +961,252 @@ func processOneNewsletter(
 		ProcessedAt: time.Now(),
 		Source:      sourceNewsletter,
 		SourceURL:   p.URL,
+	}
+	fmt.Printf("  done.  tags=%v\n", res.Tags)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// vournal scan + process (recovered text transcripts)
+// ---------------------------------------------------------------------------
+
+func runVournalScan(_ context.Context, args []string) error {
+	fs := flag.NewFlagSet("vournal scan", flag.ExitOnError)
+	file := fs.String("file", vnDefaultFile, "path to the recovered transcripts text file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	fmt.Printf("Parsing %s…\n", *file)
+	entries, err := vournal.ParseFile(*file)
+	if err != nil {
+		return err
+	}
+	if err := vournal.WriteCSV(vnCandidatesCSV, entries); err != nil {
+		return err
+	}
+	fmt.Printf("Wrote %s: %d entries.\n", vnCandidatesCSV, len(entries))
+	fmt.Println("Edit the CSV: set `process` to `no` for anything you want to skip.")
+	return nil
+}
+
+func runVournalProcess(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("vournal process", flag.ExitOnError)
+	limit := fs.Int("limit", 10, "max entries to process this run")
+	allowPartial := fs.Bool("allow-partial-monthly", false, "write a monthly overview for every month touched")
+	modelFlag := fs.String("model", "", "Gemini model (default env GEMINI_MODEL or gemini-2.5-flash)")
+	file := fs.String("file", vnDefaultFile, "path to the recovered transcripts text file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	model := *modelFlag
+	if model == "" {
+		model = os.Getenv("GEMINI_MODEL")
+	}
+
+	csvRows, err := vournal.ReadCSV(vnCandidatesCSV)
+	if err != nil {
+		return fmt.Errorf("read %s: %w (run `kai vournal scan` first)", vnCandidatesCSV, err)
+	}
+	procLog, err := state.LoadProcessLog(processLogPath)
+	if err != nil {
+		return err
+	}
+	monthly, err := state.LoadMonthlyDocs(monthlyDocsPath)
+	if err != nil {
+		return err
+	}
+
+	// Index full entry bodies from the source file so processOneVournal can
+	// pick them up by entry_id.
+	full, err := vournal.ParseFile(*file)
+	if err != nil {
+		return fmt.Errorf("re-parse %s: %w", *file, err)
+	}
+	byID := make(map[string]vournal.Entry, len(full))
+	for _, e := range full {
+		byID[e.EntryID] = e
+	}
+
+	var batch []vournal.Entry
+	for _, row := range csvRows {
+		if _, done := procLog[row.EntryID]; done {
+			continue
+		}
+		e, ok := byID[row.EntryID]
+		if !ok {
+			continue
+		}
+		batch = append(batch, e)
+		if len(batch) >= *limit {
+			break
+		}
+	}
+	if len(batch) == 0 {
+		fmt.Println("Nothing to process — every `yes` row is already in process_log.json.")
+		return nil
+	}
+	fmt.Printf("Processing %d entry(ies).\n", len(batch))
+
+	apiKey, err := gemini.LoadAPIKey()
+	if err != nil {
+		return err
+	}
+	gem, err := gemini.NewClient(ctx, apiKey, model)
+	if err != nil {
+		return fmt.Errorf("gemini client: %w", err)
+	}
+	gd, err := gdocs.New(ctx, clientSecretsIn, tokenPath)
+	if err != nil {
+		return fmt.Errorf("gdocs: %w", err)
+	}
+	folderID, err := gd.GetOrCreateFolder(ctx, folderName)
+	if err != nil {
+		return fmt.Errorf("folder: %w", err)
+	}
+
+	summary := state.RunSummary{StartedAt: time.Now(), Model: model}
+	touchedMonths := map[string]bool{}
+	docsTouched := map[string]bool{}
+
+	for i, e := range batch {
+		fmt.Printf("\n[%d/%d] %s  %s\n", i+1, len(batch), e.Date, e.EntryID)
+		summary.Attempted++
+		if err := processOneVournal(ctx, gem, gd, folderID, &e, procLog, monthly, docsTouched); err != nil {
+			summary.Failed++
+			summary.Failures = append(summary.Failures, state.RunFailure{UUID: e.EntryID, Stage: stageOf(err), Error: err.Error()})
+			fmt.Printf("  FAILED: %v\n", err)
+			_ = state.SaveProcessLog(processLogPath, procLog)
+			_ = state.SaveMonthlyDocs(monthlyDocsPath, monthly)
+			continue
+		}
+		summary.Succeeded++
+		touchedMonths[monthKey(e.Date)] = true
+		if err := state.SaveProcessLog(processLogPath, procLog); err != nil {
+			return err
+		}
+		if err := state.SaveMonthlyDocs(monthlyDocsPath, monthly); err != nil {
+			return err
+		}
+		if i < len(batch)-1 {
+			select {
+			case <-time.After(1 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	if *allowPartial && len(touchedMonths) > 0 {
+		fmt.Println("\nCompiling monthly overviews…")
+		for m := range touchedMonths {
+			mdoc, ok := monthly[m]
+			if !ok || mdoc.DocID == "" {
+				continue
+			}
+			body, err := gd.ReadBody(ctx, mdoc.DocID)
+			if err != nil {
+				fmt.Printf("  %s: read body failed: %v\n", m, err)
+				continue
+			}
+			overview, err := gem.MonthlyOverview(ctx, body)
+			if err != nil {
+				fmt.Printf("  %s: overview generate failed: %v\n", m, err)
+				continue
+			}
+			block := fmt.Sprintf("\n\n---\n\n_Overview compiled from %d recordings so far._\n\n%s\n",
+				mdoc.EntryCount, overview)
+			if err := gd.AppendEntry(ctx, mdoc.DocID, block); err != nil {
+				fmt.Printf("  %s: append overview failed: %v\n", m, err)
+				continue
+			}
+			mdoc.MonthlySummaryDone = "partial"
+			monthly[m] = mdoc
+			fmt.Printf("  %s: overview written (%d entries).\n", m, mdoc.EntryCount)
+		}
+		if err := state.SaveMonthlyDocs(monthlyDocsPath, monthly); err != nil {
+			return err
+		}
+	}
+
+	summary.FinishedAt = time.Now()
+	summary.WallClockSec = summary.FinishedAt.Sub(summary.StartedAt).Seconds()
+	for id := range docsTouched {
+		summary.DocsTouched = append(summary.DocsTouched, id)
+	}
+	sort.Strings(summary.DocsTouched)
+	summary.EstimatedCostUSD = float64(summary.Succeeded) * 0.001
+
+	path, err := state.SaveRunSummary(".", summary)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nTL;DR: %d/%d succeeded, %d failed, ~$%.3f, %s  →  %s\n",
+		summary.Succeeded, summary.Attempted, summary.Failed,
+		summary.EstimatedCostUSD, fmtDuration(summary.WallClockSec), path)
+	return nil
+}
+
+func processOneVournal(
+	ctx context.Context,
+	gem *gemini.Client,
+	gd *gdocs.Service,
+	folderID string,
+	e *vournal.Entry,
+	procLog state.ProcessLog,
+	monthly state.MonthlyDocs,
+	docsTouched map[string]bool,
+) error {
+	clean := vournal.StripNoise(e.Body)
+	if strings.TrimSpace(clean) == "" {
+		return stageErr("vournal_empty_body", fmt.Errorf("entry %s was only noise markers", e.EntryID))
+	}
+
+	fmt.Printf("  summarizing (%d words)…\n", len(strings.Fields(clean)))
+	res, err := gem.Summarize(ctx, clean)
+	if err != nil {
+		return stageErr("gemini", err)
+	}
+
+	mk := monthKey(e.Date)
+	ml := monthLabel(e.Date)
+	mdoc, ok := monthly[mk]
+	if !ok || mdoc.DocID == "" {
+		title := fmt.Sprintf("Thoughts — %s", ml)
+		if id, err := gd.FindDocInFolder(ctx, folderID, title); err != nil {
+			return stageErr("drive_find", err)
+		} else if id != "" {
+			mdoc = state.MonthlyDoc{DocID: id, DocURL: fmt.Sprintf("https://docs.google.com/document/d/%s/edit", id)}
+		} else {
+			id, url, err := gd.CreateDoc(ctx, folderID, title, ml)
+			if err != nil {
+				return stageErr("drive_create", err)
+			}
+			mdoc = state.MonthlyDoc{DocID: id, DocURL: url}
+		}
+	}
+
+	block := formatEntry(e.Date, "", sourceVournal, "", res)
+	if err := gd.AppendEntry(ctx, mdoc.DocID, block); err != nil {
+		return stageErr("docs_append", err)
+	}
+	mdoc.EntryCount++
+	monthly[mk] = mdoc
+	docsTouched[mdoc.DocID] = true
+
+	if err := gd.UpdateHeader(ctx, mdoc.DocID, ml, mdoc.EntryCount, humanDuration(mdoc.TotalDurationSec)); err != nil {
+		fmt.Printf("  warning: header update failed: %v\n", err)
+	}
+
+	procLog[e.EntryID] = state.ProcessLogEntry{
+		DocID:       mdoc.DocID,
+		DocURL:      mdoc.DocURL,
+		MonthKey:    mk,
+		Summary:     res.Summary,
+		Tags:        res.Tags,
+		Date:        e.Date,
+		DurationSec: 0,
+		ProcessedAt: time.Now(),
+		Source:      sourceVournal,
 	}
 	fmt.Printf("  done.  tags=%v\n", res.Tags)
 	return nil

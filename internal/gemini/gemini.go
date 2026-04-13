@@ -229,6 +229,8 @@ func (c *Client) waitActive(ctx context.Context, name string) (*genai.File, erro
 // even though the prompt forbids it.
 var fenceRE = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)\\s*```")
 
+var summaryStrRE = regexp.MustCompile(`(?s)"summary"\s*:\s*"((?:\\.|[^"\\])*)`)
+
 func parseSummaryJSON(raw string) (string, []string, error) {
 	s := strings.TrimSpace(raw)
 	if m := fenceRE.FindStringSubmatch(s); m != nil {
@@ -238,11 +240,25 @@ func parseSummaryJSON(raw string) (string, []string, error) {
 		Summary string   `json:"summary"`
 		Tags    []string `json:"tags"`
 	}
-	if err := json.Unmarshal([]byte(s), &payload); err != nil {
-		return "", nil, fmt.Errorf("decode summary: %w (raw first 200: %q)", err, truncate(s, 200))
+	if err := json.Unmarshal([]byte(s), &payload); err == nil {
+		return payload.Summary, payload.Tags, nil
 	}
-	return payload.Summary, payload.Tags, nil
+	// Salvage path: Gemini occasionally runs over the output token cap and
+	// returns a truncated {"summary": "...", "tags": …} JSON object. Rather
+	// than fail the entry, extract the partial summary string via regex and
+	// accept empty tags.
+	if m := summaryStrRE.FindStringSubmatch(s); m != nil {
+		raw := m[1]
+		// Unescape common JSON escapes.
+		raw = strings.ReplaceAll(raw, `\"`, `"`)
+		raw = strings.ReplaceAll(raw, `\n`, "\n")
+		raw = strings.ReplaceAll(raw, `\\`, `\`)
+		return strings.TrimSpace(raw), nil, nil
+	}
+	return "", nil, fmt.Errorf("decode summary: %w (raw first 200: %q)", errMalformed, truncate(s, 200))
 }
+
+var errMalformed = fmt.Errorf("malformed summary response")
 
 func filepathExt(p string) string { return filepath.Ext(p) }
 
