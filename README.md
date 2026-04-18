@@ -2,7 +2,7 @@
 
 > **"Thoughts become things."** — Kai Greene
 
-Named for the bodybuilder and two-time Mr. Olympia runner-up Kai Greene, whose line "thoughts become things" is the whole point. kAI the tool turns thinking — driving monologues, livestream riffs, newsletter drafts — into durable, queryable things.
+Named for the bodybuilder and three-time Mr. Olympia runner-up Kai Greene, whose line "thoughts become things" is the whole point. kAI the tool turns thinking — driving monologues, livestream riffs, newsletter drafts — into durable, queryable things.
 
 ## What it does
 
