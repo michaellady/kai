@@ -31,6 +31,7 @@ Kai is a Go CLI at `/Users/mikelady/dev/kai/kai` that ingests four content sourc
 ## Prerequisites (verify before first run of a session)
 
 - `client_secrets.json` + `gemini_api_key.txt` + `google_token.json` present in repo root — if missing, stop and point the user at the setup section of `README.md`. Do not try to create them.
+- `google_token.json` expires roughly **every 7 days** while the OAuth consent screen is in "Testing" status. If the last run was over a week ago, expect a re-consent (see the `invalid_grant` row in failure patterns). Publishing the consent screen Testing → Production removes the expiry for good.
 - `ffmpeg`, `osxphotos`, `yt-dlp` on PATH.
 - macOS **Settings → Photos → Optimize Mac Storage** on, otherwise iCloud originals accumulate ~200 GB.
 - Gemini API billing enabled on the linked GCP project. Free tier caps at 20 requests/day.
@@ -65,6 +66,7 @@ Cadence for scheduled checks: first check at ~10% of expected wall-clock, then h
 | `wait active: file processing failed` | iPhone video too large (>1 GB) choked Gemini's file processor. | Audio-extract path (current default) sidesteps this. If it recurs, check that ffmpeg step ran. |
 | `RESOURCE_EXHAUSTED`, daily quota | Free-tier Gemini hit. | Enable billing on the GCP project linked to the key; no code change. |
 | `Your project has been denied access` (PERMISSION_DENIED) | GCP billing flagged mid-run. | User must resolve via Cloud Console billing. Retry with `kai process --limit 50` once cleared. |
+| `auth: cannot fetch token: 400` / `invalid_grant` at startup (folder lookup) | Google refresh token expired (~7-day life while consent screen is in "Testing"). Binary won't re-prompt — `loadOrFetchToken` (`internal/gdocs/gdocs.go`) only runs the browser flow when the token file is missing/unparseable, and a present-but-expired token parses fine. | `mv google_token.json google_token.json.expired-<date>`, then re-run `kai process`. It opens a browser for consent (localhost-listener flow, 5-min timeout), writes a fresh token, and continues — works even from a backgrounded run. Durable fix: publish the OAuth consent screen Testing → Production. |
 | `summary parse: decode summary...` | Gemini output-token cap truncated JSON. | Already mitigated: salvage path extracts partial summary, writes entry with empty tags. |
 | `osxphotos export ...: signal: killed` | Per-video download timeout (15 min). | Retry — re-running `kai process` picks up only the failed row via `process_log.json`. |
 | `captions_unavailable` | YouTube hasn't generated auto-captions for a recent livestream yet. | Re-run after a few hours. |
